@@ -1,0 +1,9 @@
+streamlit
+python-dotenv
+openai
+reportlab
+python-docx
+markdown2
+beautifulsoup4
+requests
+bs4
