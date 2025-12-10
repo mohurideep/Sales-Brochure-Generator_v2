@@ -1,5 +1,6 @@
 from bs4 import BeautifulSoup
 import requests
+from urllib.parse import urljoin
 
 
 # Standard headers to fetch a website
@@ -35,3 +36,32 @@ def fetch_website_links(url):
     soup = BeautifulSoup(response.content, "html.parser")
     links = [link.get("href") for link in soup.find_all("a")]
     return [link for link in links if link]
+
+
+def extract_logo_and_color(url):
+    """Extracts logo URL + dominant brand color"""
+    try:
+        html = requests.get(url, timeout=10).text
+        soup = BeautifulSoup(html, "html.parser")
+
+        # Try common logo selectors
+        logo = None
+        for tag in soup.find_all(["img", "link"]):
+            src = tag.get("src") or tag.get("href")
+            if src and ("logo" in src.lower() or "icon" in src.lower()):
+                logo = urljoin(url, src)
+                break
+
+        # Extract main color
+        style_tags = soup.find_all("style")
+        colors = []
+        import re
+        for t in style_tags:
+            found = re.findall(r'#[0-9A-Fa-f]{6}', t.text)
+            colors.extend(found)
+        primary_color = colors[0] if colors else "#000000"
+
+        return logo, primary_color
+
+    except:
+        return None, "#000000"
