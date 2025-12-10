@@ -8,6 +8,7 @@ from docx import Document
 from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import letter
 import markdown2
+from groq import Groq
 
 from scraper import fetch_website_links, fetch_website_contents,extract_logo_and_color
 
@@ -15,24 +16,32 @@ from scraper import fetch_website_links, fetch_website_contents,extract_logo_and
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
 
-api_key = os.getenv("OPENROUTER_API_KEY") or st.secrets.get("OPENROUTER_API_KEY")
-if not api_key:
-    raise ValueError("OPENROUTER_API_KEY is not set in .env")
+# API KEYS
+openrouter_key = os.getenv("OPENROUTER_API_KEY") or st.secrets.get("OPENROUTER_API_KEY")
+if not openrouter_key:
+    raise ValueError("OPENROUTER_API_KEY missing")
 
-# OpenRouter client
-client = OpenAI(
-    base_url="https://openrouter.ai/api/v1",
-    api_key=api_key,
-)
+groq_key = os.getenv("GROQ_API_KEY") or st.secrets.get("GROQ_API_KEY")
+if not groq_key:
+    raise ValueError("GROQ_API_KEY missing")
 
-# ---------------- AVAILABLE FREE MODELS ----------------
+# Clients
+openrouter_client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=openrouter_key)
+groq_client = Groq(api_key=groq_key)
+
+
+# ---------------- AVAILABLE MODELS (with provider) ----------------
+# (model_id, provider_used)
 FREE_MODELS = {
-    "DeepSeek R1-Chimera 🟢 JSON-SAFE • Stable • Best Choice": "tngtech/deepseek-r1t2-chimera:free",
-    "Qwen 3 A22B 🟡 JSON-SAFE • Large Model": "qwen/qwen3-235b-a22b:free",
-    "Llama 3 Instruct❗ High Load • Slow on Free Tier": "meta-llama/llama-3.3-70b-instruct:free",
-    "Mistral Instruct 🟡 Fast • Good Quality": "mistralai/mistral-7b-instruct:free"
-}
+    "DeepSeek R1-Chimera 🟢 Best Choice": ("tngtech/deepseek-r1t2-chimera:free", "openrouter"),
+    "Qwen 3 A22B Large 🟡": ("qwen/qwen3-235b-a22b:free", "openrouter"),
+    "Llama 3 Instruct ❗ Slow Free Tier": ("meta-llama/llama-3.3-70b-instruct:free", "openrouter"),
+    "Mistral Instruct ⚡ Fast": ("mistralai/mistral-7b-instruct:free", "openrouter"),
 
+    # GROQ MODELS
+    "GPT-OSS ⚡ (Groq)": ("openai/gpt-oss-120b", "groq")
+}
+FALLBACK_MODEL = ("tngtech/deepseek-r1t2-chimera:free", "openrouter")
 
 link_system_prompt = """
 You are provided with a list of links found on a webpage.
@@ -55,12 +64,48 @@ Respond in markdown without code blocks.
 Include details of company culture, customers and careers/jobs if you have the information.
 """
 
+def llm_stream(model_id, provider, messages):
+    """Stream output token-by-token."""
+    
+    # ---- GROQ Streaming ----
+    if provider == "groq":
+        return groq_client.chat.completions.create(
+            model=model_id,
+            messages=messages,
+            temperature=0.3,
+            stream=True
+        )
+
+    # ---- OpenRouter Streaming ----
+    return openrouter_client.chat.completions.create(
+        model=model_id,
+        messages=messages,
+        stream=True
+    )
+
+
+def llm_chat(model_id, provider, messages, response_format=None):
+    """Unified call → routes to Groq or OpenRouter automatically"""
+
+    if provider == "groq":
+        return groq_client.chat.completions.create(
+            model=model_id,
+            messages=messages,
+            temperature=0.3
+        )
+    
+    return openrouter_client.chat.completions.create(
+        model=model_id,
+        messages=messages,
+        response_format=response_format   # only OpenRouter supports this currently
+    )
+
 def get_links_user_prompt(url: str) -> str:
     user_prompt = f"""
-Here is the list of links on the website {url} -
-Please decide which of these are relevant web links for a brochure about the company, 
-respond with the full https URL in JSON format.
-Do not include Terms of Service, Privacy, email links.
+    Here is the list of links on the website {url} -
+    Please decide which of these are relevant web links for a brochure about the company, 
+    respond with the full https URL in JSON format.
+    Do not include Terms of Service, Privacy, email links.
 
 Links (some might be relative links):
 
@@ -69,18 +114,17 @@ Links (some might be relative links):
     user_prompt += "\n".join(links)
     return user_prompt
 
-def select_relevant_links(url: str, model_name: str) -> dict:
-    response = client.chat.completions.create(
-        model=model_name,
+def select_relevant_links(url: str, model_pack):
+    model_id, provider = model_pack
+    response = llm_chat(
+        model_id, provider,
         messages=[
             {"role": "system", "content": link_system_prompt},
             {"role": "user", "content": get_links_user_prompt(url)},
         ],
-        response_format={"type": "json_object"},
+        response_format={"type": "json_object"} if provider!="groq" else None
     )
-    result = response.choices[0].message.content
-    links = json.loads(result)
-    return links
+    return json.loads(response.choices[0].message.content)
 
 def fetch_page_and_all_relevant_links(url: str, model_name: str) -> str:
     contents = fetch_website_contents(url)
@@ -91,25 +135,49 @@ def fetch_page_and_all_relevant_links(url: str, model_name: str) -> str:
         result += fetch_website_contents(link["url"])
     return result
 
-def get_brochure_user_prompt(company_name: str, url: str,model_name: str) -> str:
+def get_brochure_user_prompt(company_name: str, url: str,model_pack):
     user_prompt = f"""
-    You are looking at a company called: {company_name}
-    Here are the contents of its landing page and other relevant pages;
-    use this information to build a short brochure of the company in markdown without code blocks.\n\n
-    """
-    user_prompt += fetch_page_and_all_relevant_links(url,model_name)
-    user_prompt = user_prompt[:5000]  # truncate
+You are looking at a company called: {company_name}
+Here are the contents of its landing page and other relevant pages;
+use this information to build a short brochure of the company in markdown without code blocks.\n\n
+"""
+    user_prompt += fetch_page_and_all_relevant_links(url,model_pack)
+    user_prompt = user_prompt[:5_000] # Truncate if more than 5,000 characters
     return user_prompt
 
-def create_brochure_text(company_name: str, url: str, model_name: str) -> str:
-    response = client.chat.completions.create(
-        model=model_name,
+def create_brochure_text(company_name: str, url: str, model_pack) :
+    model_id, provider = model_pack
+    response = llm_chat(
+        model_id, provider,
         messages=[
             {"role": "system", "content": brochure_system_prompt},
-            {"role": "user", "content": get_brochure_user_prompt(company_name, url,model_name)},
+            {"role": "user", "content": get_brochure_user_prompt(company_name, url,model_pack)},
         ],
     )
     return response.choices[0].message.content
+
+def stream_brochure_text(company_name: str, url: str, model_pack):
+    """
+    Streams brochure text from the LLM.
+    Yields the *full* text so far on every token chunk.
+    """
+    model_id, provider = model_pack
+
+    messages = [
+        {"role": "system", "content": brochure_system_prompt},
+        {"role": "user", "content": get_brochure_user_prompt(company_name, url, model_pack)},
+    ]
+
+    stream = llm_stream(model_id, provider, messages)
+
+    full_text = ""
+    for chunk in stream:
+        # Both Groq and OpenRouter are OpenAI-compatible here
+        delta = chunk.choices[0].delta
+        part = delta.content or ""
+        if part:
+            full_text += part
+            yield full_text  # progressively larger text
 
 # ---------- Export helpers ----------
 
@@ -195,7 +263,7 @@ def save_as_html(text: str, filename: Path, logo_url=None, brand_color="#000000"
     return filename
 
 
-def generate_brochure(company_name: str, url: str, model_name: str, formats=None, output_dir: Path | None = None):
+def generate_brochure(company_name: str, url: str, model_pack, formats=None, output_dir: Path | None = None,precomputed_text: str | None = None):
     """
     End-to-end pipeline:
       - scrapes + selects links
@@ -210,13 +278,22 @@ def generate_brochure(company_name: str, url: str, model_name: str, formats=None
         output_dir = BASE_DIR / "output"
     output_dir.mkdir(exist_ok=True)
 
-    try:
-        text = create_brochure_text(company_name, url, model_name)
-    except Exception as e:
-        # Auto fallback if model rate-limited or fails
-        fallback_model = "tngtech/deepseek-r1t2-chimera:free"
-        st.warning(f"{model_name} failed due to rate limits. Switching to fallback model: DeepSeek R1-Chimera")
-        text = create_brochure_text(company_name, url, fallback_model)
+    # try:
+    #     text = create_brochure_text(company_name, url, model_pack)
+    # except Exception as e:
+    #     # Auto fallback if model rate-limited or fails
+    #     st.warning(f"{model_pack} failed due to: {e}\nSwitching to fallback model.")
+    #     text = create_brochure_text(company_name, url, FALLBACK_MODEL)
+    if precomputed_text is not None:
+        # We already streamed the text in the UI – reuse it
+        text = precomputed_text
+    else:
+        try:
+            text = create_brochure_text(company_name, url, model_pack)
+        except Exception as e:
+            # Auto fallback if model rate-limited or fails
+            st.warning(f"{model_pack} failed due to: {e}\nSwitching to fallback model.")
+            text = create_brochure_text(company_name, url, FALLBACK_MODEL)
 
     # ------- Extract branding visual elements -------
     logo_url, brand_color = extract_logo_and_color(url)
